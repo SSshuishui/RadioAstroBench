@@ -173,3 +173,71 @@ The optimized CUDA tasks `03-ws-pix2lmn-nest.py` and `04-ws-pix2lmn-ring.py  # u
 5. Original CUDA source snapshots are archived under:
    - `radio_astronomy_cuda_bench/kernels/original/ws/`
    - `radio_astronomy_cuda_bench/kernels/original/3d/`
+
+## Baselines
+
+All optimization methods are placed under `baselines/` so that future methods can share the same benchmark interface.
+
+```text
+baselines/
+  llm_direct/     # LLM-only direct optimization baseline, implemented now
+  cudaforge/      # placeholder for future CudaForge adaptation
+  kernelmem/      # placeholder for future KernelMem adaptation
+  ours/           # placeholder for the proposed method
+```
+
+### LLM-only direct baseline
+
+This baseline reads one `radio_bench` task, asks an OpenAI-compatible chat model to append a new `ModelNew`, runs `run_smoke.py`, and optionally repairs the candidate using compile/runtime/correctness feedback.
+
+Environment variables for real model calls:
+
+```bash
+export LLM_API_KEY="..."
+export LLM_API_BASE="https://.../v1"
+export LLM_MODEL="..."
+```
+
+Run one task:
+
+```bash
+export PYTHONPATH=$PWD:$PYTHONPATH
+export TORCH_CUDA_ARCH_LIST="8.9"
+
+CUDA_VISIBLE_DEVICES=0 python -m baselines.llm_direct.run_llm_direct \
+  --task radio_bench/level1/05-ws-build-nm1.py \
+  --scale smoke \
+  --warmup 3 \
+  --repeat 5 \
+  --max-iters 3
+```
+
+Harness-only mock test, without calling a model:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m baselines.llm_direct.run_llm_direct \
+  --task radio_bench/level1/05-ws-build-nm1.py \
+  --scale smoke \
+  --warmup 1 \
+  --repeat 2 \
+  --max-iters 1 \
+  --mock
+```
+
+Outputs are written to:
+
+```text
+baselines/llm_direct/runs/<timestamp>/
+```
+
+Each attempt stores:
+
+```text
+llm_raw.txt
+candidate_snippet.py
+candidate_task.py
+bench_result.json
+stdout.txt
+stderr.txt
+result.json
+```
