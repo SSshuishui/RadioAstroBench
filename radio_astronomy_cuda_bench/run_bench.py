@@ -1,0 +1,159 @@
+from __future__ import annotations
+
+import argparse
+import inspect
+import json
+import traceback
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from radio_astronomy_cuda_bench.common import (
+    compare_outputs,
+    cuda_time_ms,
+    estimate_tensor_bytes,
+    flatten_outputs,
+    human_bytes,
+    load_task,
+    require_cuda,
+    tensor_summary,
+)
+from radio_astronomy_cuda_bench.configs.scales import get_scale, scale_to_dict
+
+def discover_tasks(root: Path) -> list[Path]:
+    return sorted((root / "radio_bench").glob("level*/*.py"))
+
+
+def resolve_task_paths(root: Path, task: str) -> list[Path]:
+    if task == "all":
+        return discover_tasks(root)
+    p = Path(task)
+    if not p.is_absolute():
+        p = root / p
+    return [p]
+
+
+def call_get_inputs(mod: Any, scale: str, segment_profile: str, fixture: str | None):
+    fn = mod.get_inputs
+    sig = inspect.signature(fn)
+    kwargs = {}
+    if "scale" in sig.parameters:
+        kwargs["scale"] = scale
+    if "segment_profile" in sig.parameters:
+        kwargs["segment_profile"] = segment_profile
+    if "fixture" in sig.parameters:
+        kwargs["fixture"] = fixture
+    return fn(**kwargs)
+
+
+def task_supports_scale(mod: Any, scale: str) -> bool:
+    supported = getattr(mod, "SUPPORTED_SCALES", None)
+    if supported is None:
+        # Old smoke tasks do not declare support; allow smoke only unless their
+        # get_inputs accepts scale.
+        return scale == "smoke" or "scale" in inspect.signature(mod.get_inputs).parameters
+    return scale in supported
+
+
+def run_one(task_path: Path, *, scale: str, segment_profile: str, fixture: str | None,
+            warmup: int, repeat: int, run_identity: bool) -> dict:
+    mod = load_task(task_path)
+    task_id = getattr(mod, "TASK_ID", task_path.stem)
+    if not task_supports_scale(mod, scale):
+        return {
+            "task_id": task_id,
+            "task_path": str(task_path),
+            "scale": scale,
+            "skipped": True,
+            "reason": f"task does not support scale={scale}",
+            "supported_scales": getattr(mod, "SUPPORTED_SCALES", None),
+        }
+    cfg = get_scale(scale)
+    if ("visibility" in task_id.lower()) and not cfg.run_visibility:
+        return {"task_id": task_id, "scale": scale, "skipped": True, "reason": "scale disables visibility tasks"}
+    if ("recon" in task_id.lower()) and not cfg.run_reconstruction:
+        return {"task_id": task_id, "scale": scale, "skipped": True, "reason": "scale disables reconstruction tasks"}
+
+    inputs = call_get_inputs(mod, scale=scale, segment_profile=segment_profile, fixture=fixture)
+    input_bytes = estimate_tensor_bytes([x for x in inputs if isinstance(x, torch.Tensor)])
+    model = mod.Model().cuda().eval()
+    with torch.no_grad():
+        out = model(*inputs)
+    summaries = [tensor_summary(t) for t in flatten_outputs(out)]
+    output_bytes = estimate_tensor_bytes(flatten_outputs(out))
+    base_ms = cuda_time_ms(model, inputs, warmup=warmup, repeat=repeat)
+    result = {
+        "task_id": task_id,
+        "task_path": str(task_path),
+        "scale": scale,
+        "scale_config": scale_to_dict(cfg),
+        "segment_profile": segment_profile,
+        "fixture": fixture or "",
+        "input_bytes": input_bytes,
+        "input_memory": human_bytes(input_bytes),
+        "output_bytes": output_bytes,
+        "output_memory": human_bytes(output_bytes),
+        "baseline_ms": base_ms,
+        "outputs": summaries,
+    }
+    if hasattr(mod, "describe_inputs"):
+        try:
+            result["input_description"] = mod.describe_inputs(scale=scale, segment_profile=segment_profile, fixture=fixture)
+        except Exception as e:
+            result["input_description_error"] = str(e)
+    if run_identity and hasattr(mod, "ModelNew"):
+        cand = mod.ModelNew().cuda().eval()
+        with torch.no_grad():
+            out_new = cand(*inputs)
+        cand_ms = cuda_time_ms(cand, inputs, warmup=warmup, repeat=repeat)
+        result["identity_candidate_ms"] = cand_ms
+        result["identity_speedup"] = base_ms / cand_ms if cand_ms > 0 else None
+        result["identity_correctness"] = compare_outputs(out, out_new)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Run extracted existing-CUDA RadioKernelBench tasks.")
+    parser.add_argument("--task", default="all", help="all or path to one task file")
+    parser.add_argument("--scale", default="smoke", choices=["smoke", "nside512_full", "nside4096_full", "nside16384_full"])
+    parser.add_argument("--segment-profile", default="all10", help="all10 or seg<id>, e.g. seg5")
+    parser.add_argument("--fixture", default="", help="optional fixture root directory")
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--repeat", type=int, default=10)
+    parser.add_argument("--no-identity", action="store_true", help="only run Model, not ModelNew identity candidate")
+    parser.add_argument("--json", default="", help="optional path to write JSON result")
+    args = parser.parse_args()
+
+    require_cuda()
+    root = Path(__file__).resolve().parents[1]
+    task_paths = resolve_task_paths(root, args.task)
+    results = []
+    for p in task_paths:
+        rel = p.relative_to(root) if p.is_relative_to(root) else p
+        print(f"\n=== Running {rel} scale={args.scale} segment={args.segment_profile} ===", flush=True)
+        try:
+            r = run_one(
+                p,
+                scale=args.scale,
+                segment_profile=args.segment_profile,
+                fixture=args.fixture or None,
+                warmup=args.warmup,
+                repeat=args.repeat,
+                run_identity=not args.no_identity,
+            )
+            results.append(r)
+            print(json.dumps(r, indent=2), flush=True)
+        except Exception as e:
+            err = {"task_path": str(p), "scale": args.scale, "error": str(e), "traceback": traceback.format_exc()}
+            results.append(err)
+            print(json.dumps(err, indent=2), flush=True)
+    if args.json:
+        out = Path(args.json)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"\nWrote {out}")
+
+
+if __name__ == "__main__":
+    main()
