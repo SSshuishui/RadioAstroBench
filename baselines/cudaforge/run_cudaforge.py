@@ -1,327 +1,317 @@
 from __future__ import annotations
-
 import argparse
+import csv
 import json
+import random
 import time
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-from baselines.llm_direct.llm_client import LLMConfig, OpenAICompatibleChatClient
-
-from .candidate_utils import make_candidate_source, short_hash, strip_code_fences, task_slug
-from .evaluators import evaluate_kernelbench_candidate, evaluate_radio_candidate
-from .prompt_templates import (
-    JUDGE_SYSTEM_PROMPT,
-    SYSTEM_PROMPT,
-    build_coder_prompt,
-    build_judge_prompt,
-    build_repair_prompt,
+from .candidate import build_history_block, last_n_lines, make_candidate_source, normalize_candidate
+from .evaluators import evaluate_kernelbench, evaluate_radio, outcome_failure_text
+from .individual import KernelIndividual
+from .io_utils import extract_cuda_kernel_names, extract_json, task_slug
+from .llm import query_server
+from .ncu_profiler import (
+    load_csv_text,
+    metrics_to_prompt,
+    profile_script,
+    write_kernelbench_ncu_driver,
+    write_radio_ncu_driver,
+)
+from .prompts import (
+    DEFAULT_SYSTEM_PROMPT,
+    build_correctness_prompts,
+    build_error_prompt,
+    build_judger_optimization_prompts,
+    build_optimization_prompt,
+    build_seed_prompt,
 )
 
 
-def now_tag() -> str:
-    return time.strftime("%Y%m%d_%H%M%S")
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser("CudaForge-style iterative CUDA optimization inside radio_astronomy_agent")
+    p.add_argument("--dataset", choices=["radio", "kernelbench"], default="radio")
+    p.add_argument("--task", required=True, help="Path to one task file or directory")
+    p.add_argument("--gpu", default="RTX 4090")
+    p.add_argument("--server_type", default="deepseek")
+    p.add_argument("--server_address", default="localhost")
+    p.add_argument("--server_port", type=int, default=8000)
+    p.add_argument("--model_name", default="deepseek-coder")
+    p.add_argument("--round", "-G", type=int, default=5)
+    p.add_argument("--work_dir", type=Path, default=Path("runs/cudaforge"))
+    p.add_argument("--device", type=int, default=0)
+    p.add_argument("--warmup", type=int, default=3)
+    p.add_argument("--repeat", type=int, default=5)
+    p.add_argument("--tol", type=float, default=1e-3)
+    p.add_argument("--max_tokens", type=int, default=8192)
+    p.add_argument("--temperature", type=float, default=0.2)
+    p.add_argument("--top_p", type=float, default=1.0)
+    p.add_argument("--scale", default="smoke", help="radio_bench only")
+    p.add_argument("--segment-profile", default="all10", help="radio_bench only")
+    p.add_argument("--timeout-s", type=int, default=600)
+    p.add_argument("--first_n", type=int, default=0)
+    p.add_argument("--num_tasks", type=int, default=1)
+    p.add_argument("--shuffle_seed", type=int, default=0)
+    p.add_argument("--subproc_id", type=int, default=0)
+    p.add_argument("--mock", action="store_true", help="Do not call an LLM; use identity ModelNew")
+    p.add_argument("--no-ncu", action="store_true", help="Disable NCU profiling in optimization rounds")
+    p.add_argument("--ncu-repeat", type=int, default=20)
+    return p
 
 
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8", errors="ignore")
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
 
 
-def write_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
+def _collect_tasks(path: Path) -> List[Path]:
+    if path.is_file():
+        return [path]
+    if path.is_dir():
+        return sorted([p for p in path.rglob("*.py") if p.is_file()])
+    raise FileNotFoundError(path)
 
 
-def build_mock_snippet() -> str:
-    return "class ModelNew(Model):\n    pass\n"
+def _select_tasks(tasks: List[Path], first_n: int, num_tasks: int, seed: int) -> List[Path]:
+    if first_n and first_n > 0:
+        return tasks[: max(1, min(first_n, len(tasks)))]
+    k = max(1, min(num_tasks, len(tasks)))
+    rng = random.Random(seed or int(time.time()))
+    return rng.sample(tasks, k)
 
 
-def discover_tasks(repo_root: Path, dataset: str, level: str | None) -> List[Path]:
-    if dataset == "radio":
-        base = repo_root / "radio_bench"
-        if level:
-            return sorted((base / level).glob("*.py"))
-        return sorted(base.glob("level*/*.py"))
-    if dataset == "kernelbench":
-        base = repo_root / "kernelbench"
-        if level:
-            return sorted((base / level).glob("*.py"))
-        return sorted(base.glob("level*/*.py"))
-    raise ValueError(f"unknown dataset={dataset}")
-
-
-def relative_or_abs(path: Path, root: Path) -> str:
-    try:
-        return str(path.relative_to(root))
-    except Exception:
-        return str(path)
-
-
-def build_history_block(attempts: List[Dict], max_items: int = 3) -> str:
-    if not attempts:
-        return "(none)"
-    lines = []
-    for item in attempts[-max_items:]:
-        lines.append(json.dumps({
-            "attempt": item.get("attempt"),
-            "ok": item.get("ok"),
-            "stage": item.get("stage"),
-            "speedup": item.get("speedup"),
-            "candidate": item.get("candidate_task"),
-        }, ensure_ascii=False))
-    return "\n".join(lines)
-
-
-def extract_speedup(dataset: str, result_json) -> Optional[float]:
-    if not isinstance(result_json, dict):
-        return None
-    if dataset == "radio":
-        return result_json.get("identity_speedup") or result_json.get("candidate_speedup")
-    return result_json.get("speedup")
-
-
-def evaluate(
-    *,
-    dataset: str,
-    repo_root: Path,
-    reference_task: Path,
-    candidate_task: Path,
-    scale: str,
-    segment_profile: str,
-    warmup: int,
-    repeat: int,
-    timeout_s: int,
-    cuda_visible_devices: str,
-    json_path: Path,
-    tol: float,
-):
-    if dataset == "radio":
-        return evaluate_radio_candidate(
-            repo_root=repo_root,
-            candidate_task=candidate_task,
-            scale=scale,
-            segment_profile=segment_profile,
-            warmup=warmup,
-            repeat=repeat,
-            timeout_s=timeout_s,
-            cuda_visible_devices=cuda_visible_devices,
-            json_path=json_path,
-        )
-    return evaluate_kernelbench_candidate(
-        repo_root=repo_root,
-        reference_task=reference_task,
-        candidate_task=candidate_task,
-        warmup=warmup,
-        repeat=repeat,
-        timeout_s=timeout_s,
-        cuda_visible_devices=cuda_visible_devices,
-        json_path=json_path,
-        tol=tol,
+def _call_llm(args, prompt: str, system_prompt: str, log_path: Path, call_type: str, round_idx: int) -> str:
+    return query_server(
+        prompt,
+        system_prompt,
+        server_type=args.server_type,
+        model_name=args.model_name,
+        server_address=args.server_address,
+        server_port=args.server_port,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        max_tokens=args.max_tokens,
+        log_path=log_path,
+        call_type=call_type,
+        round_idx=round_idx,
     )
 
 
-def run_one_task(args, repo_root: Path, task_path: Path, run_root: Path, client: OpenAICompatibleChatClient | None) -> Dict:
-    original_source = read_text(task_path)
-    rel_task = relative_or_abs(task_path, repo_root)
-    slug = task_slug(rel_task)
-    task_run_dir = run_root / slug
-    task_run_dir.mkdir(parents=True, exist_ok=True)
-    (task_run_dir / "original_task.py").write_text(original_source, encoding="utf-8")
+def _mock_code() -> str:
+    return "class ModelNew(Model):\n    pass\n"
 
-    profile_text = ""
-    if args.profile_text_file:
-        profile_path = Path(args.profile_text_file)
-        if profile_path.exists():
-            profile_text = profile_path.read_text(encoding="utf-8", errors="ignore")
 
-    summary: Dict = {
-        "baseline": "cudaforge",
-        "dataset": args.dataset,
-        "task": rel_task,
-        "scale": args.scale,
-        "segment_profile": args.segment_profile,
-        "attempts": [],
-        "best": None,
-    }
-
-    previous_snippet = ""
-    previous_failure = ""
-    judge_plan = ""
-
-    for attempt in range(args.max_iters):
-        attempt_dir = task_run_dir / f"attempt_{attempt:02d}"
-        attempt_dir.mkdir(parents=True, exist_ok=True)
-
-        if args.mock:
-            raw = build_mock_snippet()
-        else:
-            if attempt > 0 and previous_failure:
-                prompt = build_repair_prompt(
-                    dataset=args.dataset,
-                    task_path=rel_task,
-                    task_source=original_source,
-                    previous_snippet=previous_snippet,
-                    failure_text=previous_failure,
-                    scale=args.scale,
-                    warmup=args.warmup,
-                    repeat=args.repeat,
-                )
-            else:
-                prompt = build_coder_prompt(
-                    dataset=args.dataset,
-                    task_path=rel_task,
-                    task_source=original_source,
-                    scale=args.scale,
-                    warmup=args.warmup,
-                    repeat=args.repeat,
-                    history_block=build_history_block(summary["attempts"]),
-                    judge_plan=judge_plan,
-                )
-            (attempt_dir / "coder_prompt.txt").write_text(prompt, encoding="utf-8")
-            raw = client.complete_text([{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}])  # type: ignore[union-attr]
-
-        snippet = strip_code_fences(raw)
-        (attempt_dir / "llm_raw.txt").write_text(raw, encoding="utf-8")
-        (attempt_dir / "candidate_snippet.py").write_text(snippet, encoding="utf-8")
-
-        try:
-            candidate_source = make_candidate_source(original_source, snippet, label=f"attempt={attempt} hash={short_hash(snippet)}")
-        except Exception as e:  # noqa: BLE001
-            failure = f"Candidate snippet validation failed: {e}"
-            previous_snippet = snippet
-            previous_failure = failure
-            record = {"attempt": attempt, "ok": False, "stage": "snippet_validation", "failure": failure}
-            summary["attempts"].append(record)
-            write_json(attempt_dir / "result.json", record)
-            continue
-
-        candidate_task = attempt_dir / "candidate_task.py"
-        candidate_task.write_text(candidate_source, encoding="utf-8")
-
-        eval_result = evaluate(
-            dataset=args.dataset,
-            repo_root=repo_root,
-            reference_task=task_path,
-            candidate_task=candidate_task,
+def _evaluate(args, repo: Path, dataset: str, task: Path, candidate: Path, attempt_dir: Path):
+    if dataset == "radio":
+        return evaluate_radio(
+            repo_root=repo,
+            candidate_task=candidate,
             scale=args.scale,
             segment_profile=args.segment_profile,
             warmup=args.warmup,
             repeat=args.repeat,
+            device=args.device,
             timeout_s=args.timeout_s,
-            cuda_visible_devices=args.cuda_visible_devices,
             json_path=attempt_dir / "bench_result.json",
-            tol=args.tol,
         )
-        (attempt_dir / "stdout.txt").write_text(eval_result.stdout, encoding="utf-8")
-        (attempt_dir / "stderr.txt").write_text(eval_result.stderr, encoding="utf-8")
-
-        speedup = extract_speedup(args.dataset, eval_result.result_json)
-        record = {
-            "attempt": attempt,
-            "ok": eval_result.ok,
-            "stage": eval_result.stage,
-            "returncode": eval_result.returncode,
-            "speedup": speedup,
-            "candidate_task": relative_or_abs(candidate_task, repo_root),
-            "bench_result": eval_result.result_json,
-        }
-        summary["attempts"].append(record)
-        write_json(attempt_dir / "result.json", record)
-
-        previous_snippet = snippet
-        previous_failure = eval_result.failure_text()
-
-        if eval_result.ok:
-            best_speedup = summary["best"].get("speedup") if isinstance(summary.get("best"), dict) else None
-            if summary["best"] is None or (speedup is not None and (best_speedup is None or speedup > best_speedup)):
-                summary["best"] = {
-                    "attempt": attempt,
-                    "speedup": speedup,
-                    "candidate_task": relative_or_abs(candidate_task, repo_root),
-                    "candidate_snippet": relative_or_abs(attempt_dir / "candidate_snippet.py", repo_root),
-                    "bench_result": eval_result.result_json,
-                }
-            if args.judge_after_success and not args.mock and attempt + 1 < args.max_iters:
-                judge_prompt = build_judge_prompt(
-                    dataset=args.dataset,
-                    task_path=rel_task,
-                    task_source=original_source,
-                    result_json=json.dumps(eval_result.result_json, indent=2, ensure_ascii=False) if eval_result.result_json else "{}",
-                    stdout_tail=eval_result.stdout,
-                    stderr_tail=eval_result.stderr,
-                    ncu_text=profile_text,
-                )
-                (attempt_dir / "judge_prompt.txt").write_text(judge_prompt, encoding="utf-8")
-                judge_plan = client.complete_text([{"role": "system", "content": JUDGE_SYSTEM_PROMPT}, {"role": "user", "content": judge_prompt}])  # type: ignore[union-attr]
-                (attempt_dir / "judge_plan.txt").write_text(judge_plan, encoding="utf-8")
-                previous_failure = ""
-                if not args.continue_after_success:
-                    # one success + judge record is enough unless user requests more
-                    break
-            elif not args.continue_after_success:
-                break
-
-    write_json(task_run_dir / "summary.json", summary)
-    return summary
+    return evaluate_kernelbench(
+        ref_task=task,
+        candidate_task=candidate,
+        warmup=args.warmup,
+        repeat=args.repeat,
+        device=args.device,
+        tol=args.tol,
+    )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="CudaForge-style baseline for radio_bench and KernelBench tasks.")
-    parser.add_argument("--dataset", default="radio", choices=["radio", "kernelbench"])
-    parser.add_argument("--task", default="", help="Path to one task file. If omitted, use --level.")
-    parser.add_argument("--level", default="", help="Run all tasks in a level, e.g. level1/level2/level3/level4.")
-    parser.add_argument("--first-n", type=int, default=0, help="Limit discovered tasks to the first N.")
-    parser.add_argument("--scale", default="smoke", choices=["smoke", "nside512_full", "nside4096_full", "nside16384_full"])
-    parser.add_argument("--segment-profile", default="all10")
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--tol", type=float, default=1e-4, help="KernelBench tolerance.")
-    parser.add_argument("--max-iters", type=int, default=5)
-    parser.add_argument("--continue-after-success", action="store_true")
-    parser.add_argument("--judge-after-success", action="store_true", help="Ask a judge for the next optimization plan after a successful candidate.")
-    parser.add_argument("--profile-text-file", default="", help="Optional NCU/profile text included in judge prompt.")
-    parser.add_argument("--mock", action="store_true", help="Use identity ModelNew instead of calling an LLM.")
-    parser.add_argument("--model", default="")
-    parser.add_argument("--api-base", default="")
-    parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--max-tokens", type=int, default=8192)
-    parser.add_argument("--timeout-s", type=int, default=600)
-    parser.add_argument("--cuda-visible-devices", default="0")
-    parser.add_argument("--run-root", default="baselines/cudaforge/runs")
-    args = parser.parse_args()
-
-    repo_root = Path.cwd().resolve()
-    if args.task:
-        task_paths = [Path(args.task)]
-        task_paths = [p if p.is_absolute() else repo_root / p for p in task_paths]
+def _profile(args, repo: Path, dataset: str, task: Path, candidate: Path, attempt_dir: Path) -> str:
+    if args.no_ncu:
+        return "NCU disabled by --no-ncu."
+    kernels = extract_cuda_kernel_names(candidate)
+    driver = attempt_dir / "ncu_driver.py"
+    csv_path = attempt_dir / "ncu_metrics.csv"
+    if dataset == "radio":
+        write_radio_ncu_driver(driver, candidate, args.scale, args.segment_profile, args.warmup, args.repeat)
     else:
-        task_paths = discover_tasks(repo_root, args.dataset, args.level or None)
-        if args.first_n > 0:
-            task_paths = task_paths[: args.first_n]
-    if not task_paths:
-        raise RuntimeError("No tasks selected")
+        write_kernelbench_ncu_driver(driver, task, candidate, args.warmup, args.repeat, args.device, args.tol)
+    try:
+        profile_script(driver, csv_path, kernel_names=kernels, repeat=args.ncu_repeat, cwd=repo)
+        return metrics_to_prompt(load_csv_text(csv_path))
+    except Exception as e:
+        return "NCU profiling failed or unavailable. Fallback to benchmark metrics.\n" + str(e)[-4000:]
 
-    client = None
-    if not args.mock:
-        config = LLMConfig.from_env(
-            model=args.model or None,
-            api_base=args.api_base or None,
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-            timeout_s=args.timeout_s,
-        )
-        client = OpenAICompatibleChatClient(config)
 
-    run_root = repo_root / args.run_root / f"{now_tag()}_{args.dataset}"
-    run_root.mkdir(parents=True, exist_ok=True)
-    all_summaries = []
-    for task_path in task_paths:
-        print(f"\n=== CudaForge baseline: dataset={args.dataset} task={relative_or_abs(task_path, repo_root)} ===", flush=True)
-        summary = run_one_task(args, repo_root, task_path, run_root, client)
-        all_summaries.append(summary)
-        print(json.dumps(summary.get("best"), indent=2, ensure_ascii=False), flush=True)
-    write_json(run_root / "summary_all.json", all_summaries)
-    print(f"\nWrote {run_root}")
+def _append_usage_totals(log_path: Path) -> Dict[str, int]:
+    totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    if not log_path.exists():
+        return totals
+    with log_path.open("r", newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        for k in totals:
+            try:
+                totals[k] += int(r.get(k, 0) or 0)
+            except Exception:
+                pass
+    with log_path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["timestamp", "round_idx", "call_type", "input_tokens", "output_tokens", "total_tokens"])
+        writer.writerow({"timestamp": "Total", "round_idx": "", "call_type": "sum", **totals})
+    return totals
+
+
+def _save_curve(path: Path, scores: List[float], error_flags: List[bool], title: str):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        xs = list(range(len(scores)))
+        plt.figure()
+        plt.plot(xs, scores, marker="o")
+        for x, y, bad in zip(xs, scores, error_flags):
+            if bad:
+                plt.scatter([x], [y], marker="x")
+        plt.xlabel("Round")
+        plt.ylabel("Speedup")
+        plt.title(title)
+        plt.grid(True, linestyle="--", alpha=0.5)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(path, bbox_inches="tight")
+        plt.close()
+    except Exception:
+        pass
+
+
+def _run_one(args, repo: Path, task: Path, batch_dir: Path) -> Dict[str, Any]:
+    task_rel = task.relative_to(repo) if task.is_relative_to(repo) else task
+    original = task.read_text(encoding="utf-8", errors="ignore")
+    task_dir = batch_dir / task_slug(task_rel)
+    code_dir = task_dir / "code"
+    eval_dir = task_dir / "evaluation"
+    io_dir = eval_dir / "llm_io"
+    for d in (code_dir, eval_dir, io_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    (task_dir / "original_task.py").write_text(original, encoding="utf-8")
+    log_path = task_dir / "usage.csv"
+
+    current: Optional[KernelIndividual] = None
+    best: Optional[KernelIndividual] = None
+    best_score = float("-inf")
+    scores: List[float] = []
+    error_flags: List[bool] = []
+    last_score = 0.0
+
+    for round_idx in range(args.round):
+        print(f"[{task_rel}] Round {round_idx}")
+        attempt_dir = eval_dir / f"attempt_{round_idx:03d}"
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+
+        if args.mock:
+            raw = _mock_code()
+            call_type = "mock"
+        elif round_idx == 0:
+            prompt = build_seed_prompt(task, args.gpu, args.dataset)
+            (io_dir / f"round{round_idx:03d}_seed_prompt.txt").write_text(prompt, encoding="utf-8")
+            raw = _call_llm(args, prompt, DEFAULT_SYSTEM_PROMPT, log_path, "seed", round_idx)
+            call_type = "seed"
+        else:
+            runnable = bool(current and current.metrics and current.metrics.get("runnable"))
+            if not runnable:
+                err = last_n_lines(current.metrics.get("message", "") if current and current.metrics else "", 160)
+                sys_p, prob_prompt = build_correctness_prompts(err, task, current.code if current else "")
+                (io_dir / f"round{round_idx:03d}_problem_identify_prompt.txt").write_text(prob_prompt, encoding="utf-8")
+                raw_prob = _call_llm(args, prob_prompt, sys_p, log_path, "problem_identify", round_idx)
+                (io_dir / f"round{round_idx:03d}_problem_identify_reply.txt").write_text(raw_prob, encoding="utf-8")
+                problem = extract_json(raw_prob)
+                prompt = build_error_prompt(current.code if current else "", err, problem, args.gpu)
+                (io_dir / f"round{round_idx:03d}_repair_prompt.txt").write_text(prompt, encoding="utf-8")
+                raw = _call_llm(args, prompt, DEFAULT_SYSTEM_PROMPT, log_path, "repair", round_idx)
+                call_type = "repair"
+            else:
+                metrics_block = _profile(args, repo, args.dataset, task, current.code_path, attempt_dir)  # type: ignore[arg-type]
+                sys_j, judge_prompt = build_judger_optimization_prompts(task, args.gpu, metrics_block, current.code)  # type: ignore[union-attr]
+                (io_dir / f"round{round_idx:03d}_judge_optimization_prompt.txt").write_text(judge_prompt, encoding="utf-8")
+                raw_judge = _call_llm(args, judge_prompt, sys_j, log_path, "judge_optimization", round_idx)
+                (io_dir / f"round{round_idx:03d}_optimization_strategy_reply.txt").write_text(raw_judge, encoding="utf-8")
+                strategy = extract_json(raw_judge)
+                prompt = build_optimization_prompt(current.code_path, args.gpu, strategy, history_block=build_history_block(code_dir, keep_last=5))  # type: ignore[arg-type]
+                (io_dir / f"round{round_idx:03d}_opt_prompt.txt").write_text(prompt, encoding="utf-8")
+                raw = _call_llm(args, prompt, DEFAULT_SYSTEM_PROMPT, log_path, "optimization", round_idx)
+                call_type = "optimization"
+
+        (io_dir / f"round{round_idx:03d}_{call_type}_raw_reply.txt").write_text(raw, encoding="utf-8")
+        try:
+            candidate_code = normalize_candidate(raw)
+            candidate_source = make_candidate_source(original, candidate_code, comment=f"CudaForge {call_type} round={round_idx}")
+            ind = KernelIndividual(candidate_source)
+            ind.save_code(code_dir)
+            out = _evaluate(args, repo, args.dataset, task, ind.code_path, attempt_dir)  # type: ignore[arg-type]
+            ind.metrics = out.metrics
+            ind.score = out.score
+            if not out.ok:
+                ind.metrics["message"] = outcome_failure_text(out)
+            ind.save_metrics(eval_dir)
+        except Exception as e:
+            ind = KernelIndividual(raw)
+            ind.metrics = {"runnable": False, "error_type": e.__class__.__name__, "message": str(e)[-8000:]}
+            ind.score = float("-inf")
+            ind.save_metrics(eval_dir)
+
+        current = ind
+        runnable = bool(ind.metrics and ind.metrics.get("runnable"))
+        if runnable and ind.score is not None:
+            last_score = float(ind.score)
+            scores.append(last_score)
+            error_flags.append(False)
+            if last_score > best_score:
+                best_score = last_score
+                best = ind
+                (task_dir / "best_candidate.py").write_text(best.code, encoding="utf-8")
+        else:
+            scores.append(last_score)
+            error_flags.append(True)
+        print(f"[round {round_idx}] runnable={runnable} score={ind.score}")
+
+    fig = task_dir / "figures" / f"{task.stem}_score.png"
+    _save_curve(fig, scores, error_flags, f"{task.stem} best={best_score:.4f}")
+    usage = _append_usage_totals(log_path)
+    return {
+        "task": str(task_rel),
+        "best_score": float(best_score) if best_score != float("-inf") else 0.0,
+        "best_runnable": bool(best and best.metrics and best.metrics.get("runnable")),
+        "task_dir": str(task_dir),
+        "figure": str(fig),
+        **usage,
+    }
+
+
+def main():
+    args = _parser().parse_args()
+    repo = _repo_root()
+    task_path = Path(args.task)
+    if not task_path.is_absolute():
+        task_path = repo / task_path
+    tasks = _collect_tasks(task_path)
+    picked = tasks if task_path.is_file() else _select_tasks(tasks, args.first_n, args.num_tasks, args.shuffle_seed)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    batch = args.work_dir / f"{stamp}_{args.dataset}_{args.model_name.replace('/', '_')}"
+    batch.mkdir(parents=True, exist_ok=True)
+    summary = []
+    for i, t in enumerate(picked, 1):
+        print(f"===== [{i}/{len(picked)}] {t} =====")
+        summary.append(_run_one(args, repo, t, batch))
+    avg = sum(x["best_score"] for x in summary) / max(1, len(summary))
+    acc = sum(1 for x in summary if x["best_runnable"]) / max(1, len(summary))
+    out = {"avg_speedup": avg, "accuracy": acc, "num_tasks": len(summary), "tasks": summary, "timestamp": datetime.now().isoformat(timespec="seconds")}
+    (batch / "summary.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+    with (batch / "summary.csv").open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["task", "best_score", "best_runnable", "task_dir", "figure"])
+        for s in summary:
+            w.writerow([s["task"], f'{s["best_score"]:.6f}', int(s["best_runnable"]), s["task_dir"], s["figure"]])
+        w.writerow([]); w.writerow(["avg_speedup", f"{avg:.6f}"]); w.writerow(["accuracy", f"{acc:.6f}"])
+    print(f"[GLOBAL] Saved {batch/'summary.json'}")
+    print(f"[GLOBAL] avg_speedup={avg:.4f} accuracy={acc:.4f}")
 
 
 if __name__ == "__main__":

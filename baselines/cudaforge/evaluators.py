@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import json
 import os
 import subprocess
@@ -10,35 +9,25 @@ from typing import Any, Dict, Optional
 
 
 @dataclass
-class EvalResult:
+class EvalOutcome:
     ok: bool
-    result_json: Optional[Dict[str, Any]]
-    stdout: str
-    stderr: str
-    returncode: int
-    stage: str
-
-    def failure_text(self) -> str:
-        parts = [f"stage={self.stage}", f"returncode={self.returncode}"]
-        if self.stdout:
-            parts.append("STDOUT:\n" + self.stdout[-12000:])
-        if self.stderr:
-            parts.append("STDERR:\n" + self.stderr[-12000:])
-        if self.result_json is not None:
-            parts.append("RESULT_JSON:\n" + json.dumps(self.result_json, indent=2)[-12000:])
-        return "\n\n".join(parts)
+    score: float
+    metrics: Dict[str, Any]
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 0
 
 
-def _load_json(path: Path):
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+def _failure_text(out: EvalOutcome) -> str:
+    parts = [f"returncode={out.returncode}", json.dumps(out.metrics, indent=2, ensure_ascii=False)[-6000:]]
+    if out.stdout:
+        parts.append("STDOUT:\n" + out.stdout[-6000:])
+    if out.stderr:
+        parts.append("STDERR:\n" + out.stderr[-6000:])
+    return "\n\n".join(parts)
 
 
-def evaluate_radio_candidate(
+def evaluate_radio(
     *,
     repo_root: Path,
     candidate_task: Path,
@@ -46,78 +35,67 @@ def evaluate_radio_candidate(
     segment_profile: str,
     warmup: int,
     repeat: int,
+    device: int,
     timeout_s: int,
-    cuda_visible_devices: str,
     json_path: Path,
-) -> EvalResult:
+) -> EvalOutcome:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
     env.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
-    env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    env["CUDA_VISIBLE_DEVICES"] = str(device)
     cmd = [
-        sys.executable,
-        "-m",
-        "radio_astronomy_cuda_bench.run_smoke",
-        "--task",
-        str(candidate_task),
-        "--scale",
-        scale,
-        "--segment-profile",
-        segment_profile,
-        "--warmup",
-        str(warmup),
-        "--repeat",
-        str(repeat),
-        "--json",
-        str(json_path),
+        sys.executable, "-m", "radio_astronomy_cuda_bench.run_smoke",
+        "--task", str(candidate_task),
+        "--scale", scale,
+        "--segment-profile", segment_profile,
+        "--warmup", str(warmup),
+        "--repeat", str(repeat),
+        "--json", str(json_path),
     ]
     proc = subprocess.run(cmd, cwd=str(repo_root), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_s)
-    data = _load_json(json_path)
-    result_json = data[0] if isinstance(data, list) and data else data if isinstance(data, dict) else None
+    metrics: Dict[str, Any] = {"runnable": False, "message": "no result json"}
     ok = False
-    if proc.returncode == 0 and isinstance(result_json, dict):
-        correctness = result_json.get("identity_correctness") or result_json.get("candidate_correctness")
-        if isinstance(correctness, dict):
-            ok = bool(correctness.get("passed"))
-        else:
-            ok = "error" not in result_json and not result_json.get("skipped", False)
-    return EvalResult(ok=ok, result_json=result_json, stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode, stage="radio")
+    score = float("-inf")
+    if json_path.exists():
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+            item = data[0] if isinstance(data, list) and data else data
+            metrics = dict(item)
+            corr = metrics.get("identity_correctness") or metrics.get("correctness") or {}
+            ok = bool(corr.get("passed", False)) and "error" not in metrics and not metrics.get("skipped")
+            metrics["runnable"] = ok
+            if ok:
+                base = float(metrics.get("baseline_ms", 0.0) or 0.0)
+                cand = float(metrics.get("identity_candidate_ms", 0.0) or 0.0)
+                score = base / max(1e-9, cand)
+                metrics["score"] = score
+        except Exception as e:
+            metrics = {"runnable": False, "error_type": "ResultParseError", "message": str(e)}
+    if proc.returncode != 0 and ok is False:
+        metrics.setdefault("error_type", "ProcessError")
+        metrics.setdefault("message", (proc.stderr or proc.stdout)[-6000:])
+    return EvalOutcome(ok=ok, score=score, metrics=metrics, stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode)
 
 
-def evaluate_kernelbench_candidate(
+def evaluate_kernelbench(
     *,
-    repo_root: Path,
-    reference_task: Path,
+    ref_task: Path,
     candidate_task: Path,
     warmup: int,
     repeat: int,
-    timeout_s: int,
-    cuda_visible_devices: str,
-    json_path: Path,
-    tol: float = 1e-4,
-) -> EvalResult:
-    script = repo_root / "baselines" / "cudaforge" / "kernelbench_eval_worker.py"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(repo_root / "baselines" / "cudaforge") + os.pathsep + str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
-    env.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
-    env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
-    cmd = [
-        sys.executable,
-        str(script),
-        "--ref",
-        str(reference_task),
-        "--candidate",
-        str(candidate_task),
-        "--warmup",
-        str(warmup),
-        "--repeat",
-        str(repeat),
-        "--tol",
-        str(tol),
-        "--json",
-        str(json_path),
-    ]
-    proc = subprocess.run(cmd, cwd=str(repo_root), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_s)
-    result_json = _load_json(json_path)
-    ok = proc.returncode == 0 and isinstance(result_json, dict) and bool(result_json.get("ok"))
-    return EvalResult(ok=ok, result_json=result_json, stdout=proc.stdout, stderr=proc.stderr, returncode=proc.returncode, stage="kernelbench")
+    device: int,
+    tol: float,
+) -> EvalOutcome:
+    from .compile_and_run import compare_and_bench
+    try:
+        res = compare_and_bench(ref_py=ref_task, test_py=candidate_task, device_idx=device, warmup=warmup, repeat=repeat, tol=tol)
+        score = float(res["ref_latency_ms"]["avg"]) / max(1e-9, float(res["test_latency_ms"]["avg"]))
+        res["runnable"] = True
+        res["score"] = score
+        return EvalOutcome(ok=True, score=score, metrics=res)
+    except Exception as e:
+        return EvalOutcome(ok=False, score=float("-inf"), metrics={"runnable": False, "error_type": e.__class__.__name__, "message": str(e)[-12000:]})
+
+
+def outcome_failure_text(out: EvalOutcome) -> str:
+    return _failure_text(out)

@@ -1,181 +1,91 @@
-# Radio Astronomy Agent Bench
+# Radio Astronomy Agent v2 — CudaForge baseline
 
-This repository contains the radio astronomy CUDA benchmark and agent-baseline adapters.
+This package keeps the project-level benchmark layout and implements a CudaForge-style baseline inside `baselines/cudaforge/`.
 
-## Top-level layout
+## Layout
 
 ```text
-radio_bench/                    # Radio Astronomy CUDA Bench tasks
-radio_astronomy_cuda_bench/     # shared harness, configs, original CUDA snapshots
-kernelbench/                    # KernelBench tasks copied from CudaForge package
+radio_bench/                      # our radio astronomy CUDA benchmark
+radio_astronomy_cuda_bench/        # radio_bench harness and shared utilities
+kernelbench/                      # outer KernelBench dataset, shared by cudaforge/kernelmem
+
 baselines/
-  llm_direct/                   # LLM-only direct candidate baseline; radio_bench only
-  cudaforge/                    # CudaForge-style baseline; supports radio_bench and KernelBench
-  kernelmem/                    # reserved for KernelMem adapter
-our_method/                     # reserved for our proposed method; not inside baselines
+  llm_direct/                     # simple LLM-only baseline for radio_bench
+  cudaforge/                      # CudaForge workflow implemented in this framework
+  kernelmem/                      # placeholder for next baseline
+
+our_method/                       # our future method, not under baselines/
 ```
 
-Naming policy for future packages:
+`kernelbench/` is intentionally at the same level as `baselines/`, not nested under `baselines/cudaforge/`.
+
+## What the CudaForge baseline does
+
+`baselines/cudaforge/run_cudaforge.py` implements the CudaForge workflow in this repository structure:
+
+1. seed candidate generation
+2. compile/correctness/latency evaluation
+3. repair loop after compilation/runtime/correctness failure
+4. Nsight Compute profiling after runnable candidates
+5. optimization judge prompt from NCU metrics
+6. optimization prompt and next candidate generation
+7. best-candidate tracking
+8. score curve, per-round metrics, `summary.json`, and `summary.csv`
+
+It supports:
 
 ```text
-radio_astronomy_agent_v1_llm.zip
-radio_astronomy_agent_v2_cudaforge.zip
-radio_astronomy_agent_v3_kernelmem.zip
-...
+--dataset radio        -> tasks under radio_bench/
+--dataset kernelbench  -> tasks under kernelbench/
 ```
 
-## Bench task naming
+## Quick checks
 
-Inside each level, task numbers are sequential. The suffix indicates the algorithm path:
-
-- `ws`: short-time stacking / 2D local-frame reconstruction path.
-- `3d`: 3D inverse reconstruction path.
-
-Example:
-
-```text
-radio_bench/level2/03-ws-recon-representative.py
-radio_bench/level2/06-3d-recon-direct.py
-```
-
-## Quick sanity checks
-
-Radio benchmark smoke:
-
-```bash
-export PYTHONPATH=$PWD:$PYTHONPATH
-export TORCH_CUDA_ARCH_LIST="8.9"
-bash run_all_smoke.sh
-```
-
-LLM-only baseline mock, radio_bench only:
-
-```bash
-bash baselines/llm_direct/run_mock.sh
-```
-
-CudaForge-style mock on radio_bench:
+Run radio_bench CudaForge mock without LLM and without NCU:
 
 ```bash
 bash run_cudaforge_radio_mock.sh
 ```
 
-CudaForge-style mock on KernelBench:
+Run KernelBench CudaForge mock:
 
 ```bash
 bash run_cudaforge_kernelbench_mock.sh
 ```
 
-## LLM-only direct baseline
+## Real LLM run
 
-This baseline is intentionally simple and only supports `radio_bench`.
-
-Run with a real OpenAI-compatible model:
+For DeepSeek-compatible usage:
 
 ```bash
-export LLM_API_KEY="..."
-export LLM_API_BASE="https://.../v1"
-export LLM_MODEL="deepseek-v4-pro"
-
-CUDA_VISIBLE_DEVICES=0 python -m baselines.llm_direct.run_llm_direct \
-  --task radio_bench/level1/05-ws-build-nm1.py \
-  --scale smoke \
-  --warmup 3 \
-  --repeat 5 \
-  --max-iters 3
-```
-
-## CudaForge-style baseline
-
-The adapter extracts the core CudaForge loop into this repo:
-
-```text
-Coder prompt -> candidate ModelNew -> compile/run/correctness/latency feedback
-            -> repair prompt on failure
-            -> optional judge plan after success
-            -> next candidate
-```
-
-It supports two datasets:
-
-```text
---dataset radio        # uses radio_astronomy_cuda_bench.run_smoke
---dataset kernelbench  # uses CudaForge's compare_and_bench evaluator under baselines/cudaforge/vendor
-```
-
-Run CudaForge-style baseline on radio_bench:
-
-```bash
-export LLM_API_KEY="..."
-export LLM_API_BASE="https://.../v1"
-export LLM_MODEL="deepseek-v4-pro"
+export DEEPSEEK_API_KEY="..."
+export PYTHONPATH=$PWD:$PYTHONPATH
+export TORCH_CUDA_ARCH_LIST="8.9"
 
 CUDA_VISIBLE_DEVICES=0 python -m baselines.cudaforge.run_cudaforge \
   --dataset radio \
   --task radio_bench/level1/05-ws-build-nm1.py \
   --scale smoke \
+  --gpu "RTX 4090" \
+  --server_type deepseek \
+  --model_name deepseek-coder \
+  --round 3 \
   --warmup 3 \
-  --repeat 5 \
-  --max-iters 3 \
-  --judge-after-success
+  --repeat 5
 ```
 
-Run CudaForge-style baseline on KernelBench:
+KernelBench:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m baselines.cudaforge.run_cudaforge \
   --dataset kernelbench \
   --task kernelbench/level1/1_Square_matrix_multiplication_.py \
+  --gpu "RTX 4090" \
+  --server_type deepseek \
+  --model_name deepseek-coder \
+  --round 3 \
   --warmup 3 \
-  --repeat 5 \
-  --max-iters 3 \
-  --judge-after-success
+  --repeat 5
 ```
 
-Run a subset:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m baselines.cudaforge.run_cudaforge \
-  --dataset radio \
-  --level level1 \
-  --first-n 3 \
-  --scale smoke \
-  --warmup 3 \
-  --repeat 5 \
-  --max-iters 2
-```
-
-## Outputs
-
-LLM direct outputs:
-
-```text
-baselines/llm_direct/runs/<timestamp>/...
-```
-
-CudaForge-style outputs:
-
-```text
-baselines/cudaforge/runs/<timestamp>_<dataset>/...
-```
-
-Each attempt stores:
-
-```text
-coder_prompt.txt
-llm_raw.txt
-candidate_snippet.py
-candidate_task.py
-bench_result.json
-stdout.txt
-stderr.txt
-result.json
-```
-
-## Current boundaries
-
-- `llm_direct` only targets `radio_bench`.
-- `cudaforge` supports both `radio_bench` and `kernelbench`.
-- `kernelmem` is only a placeholder until its source is added.
-- `our_method` is a placeholder outside `baselines/`, as requested.
-- Optional NCU/hardware feedback is represented by `--profile-text-file`; full automatic NCU collection can be added later.
+If `ncu` is not configured on the machine, add `--no-ncu` for debugging. Formal CudaForge comparisons should run with NCU enabled.
