@@ -173,3 +173,44 @@ The optimized CUDA tasks `03-ws-pix2lmn-nest.py` and `04-ws-pix2lmn-ring.py  # u
 5. Original CUDA source snapshots are archived under:
    - `radio_astronomy_cuda_bench/kernels/original/ws/`
    - `radio_astronomy_cuda_bench/kernels/original/3d/`
+
+## Agent / baseline layout
+
+External baselines live under `baselines/`, while the proposed method lives under `our_method/`.
+
+```text
+baselines/
+  kernelmem/    # KernelMem-style baseline adapter, implemented in this package
+  cudaforge/    # reserved for future CudaForge adapter
+our_method/     # reserved for the proposed method
+kernelbench/    # KernelBench tasks copied from KernelMem-main/KernelBench
+```
+
+### Run KernelMem-style baseline
+
+Mock radio benchmark harness test:
+
+```bash
+bash run_kernelmem_radio_mock.sh
+```
+
+Real radio benchmark run:
+
+```bash
+export LLM_API_KEY="..."
+export LLM_API_BASE="https://.../v1"
+export LLM_MODEL="deepseek-v4-pro"
+
+bash run_kernelmem_radio_one.sh radio_bench/level1/05-ws-build-nm1.py
+```
+
+KernelBench run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m baselines.kernelmem.run_kernelmem \
+  --bench kernelbench \
+  --task kernelbench/level1/1_Square_matrix_multiplication_.py \
+  --warmup 3 \
+  --repeat 5 \
+  --rounds 3
+```
