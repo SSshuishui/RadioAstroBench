@@ -12,7 +12,12 @@ import torch.nn as nn
 from torch.utils.cpp_extension import load_inline
 from radio_astronomy_cuda_bench.common import make_unit_vectors, make_endpoint_vectors, make_tile_meta_torch
 
+from radio_astronomy_cuda_bench.configs.scales import get_scale
+from radio_astronomy_cuda_bench.common import make_unit_vectors_cuda
+from radio_astronomy_cuda_bench.real_inputs import load_ws_visibility_fixture
+
 TASK_ID = "level2/02-ws-visibility-forward"
+SUPPORTED_SCALES = ["smoke", "nside512_full", "nside4096_full"]
 TILE_PIX = 256
 UNIQUE_BASELINES_PER_T = 28
 SIGNED_BASELINES_PER_T = 56
@@ -241,13 +246,16 @@ class ModelNew(Model):
     pass
 
 
-def get_inputs():
+def get_inputs(scale: str = "smoke", segment_profile: str = "all10", fixture: str | None = None):
+    if fixture:
+        return load_ws_visibility_fixture(fixture, scale=scale, tile_pix=TILE_PIX)
     device = "cuda"
-    n_chunk = 8192
-    n_time = 4
+    cfg = get_scale(scale)
+    n_chunk = (int(cfg.npix) // TILE_PIX) * TILE_PIX
+    n_time = 4 if scale == "smoke" else 2048
     n_full = n_time * SIGNED_BASELINES_PER_T
-    l, m, n = make_unit_vectors(n_chunk, device=device, seed=4)
-    nm1 = n - 1.0
+    l, m, n = make_unit_vectors_cuda(n_chunk, device=device, seed=4)
+    nm1 = (n - 1.0).contiguous()
     B = (1.0 + 0.05 * torch.sin(torch.arange(n_chunk, device=device, dtype=torch.float32) * 0.01)).contiguous()
     tile_meta = make_tile_meta_torch(l, m, n, TILE_PIX)
     gen = torch.Generator(device="cpu"); gen.manual_seed(5)

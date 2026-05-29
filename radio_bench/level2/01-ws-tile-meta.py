@@ -7,7 +7,11 @@ import torch.nn as nn
 from torch.utils.cpp_extension import load_inline
 from radio_astronomy_cuda_bench.common import make_unit_vectors
 
+from radio_astronomy_cuda_bench.configs.scales import get_scale
+from radio_astronomy_cuda_bench.common import make_unit_vectors_cuda
+
 TASK_ID = "level2/01-ws-tile-meta"
+SUPPORTED_SCALES = ["smoke", "nside512_full", "nside4096_full"]
 TILE_PIX = 256
 
 CPP_SRC = r"""
@@ -131,9 +135,11 @@ class ModelNew(Model):
     pass
 
 
-def get_inputs():
-    l, m, n = make_unit_vectors(8192, device="cuda", seed=3)
-    nm1 = n - 1.0
+def get_inputs(scale: str = "smoke", segment_profile: str = "all10", fixture: str | None = None):
+    cfg = get_scale(scale)
+    n_chunk = (int(cfg.npix) // TILE_PIX) * TILE_PIX
+    l, m, n = make_unit_vectors_cuda(n_chunk, device="cuda", seed=3)
+    nm1 = (n - 1.0).contiguous()
     return [l, m, n, nm1]
 
 

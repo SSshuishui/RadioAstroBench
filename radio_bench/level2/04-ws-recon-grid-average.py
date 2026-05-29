@@ -7,7 +7,12 @@ import torch.nn as nn
 from torch.utils.cpp_extension import load_inline
 from radio_astronomy_cuda_bench.common import make_unit_vectors
 
+from radio_astronomy_cuda_bench.configs.scales import get_scale
+from radio_astronomy_cuda_bench.common import make_unit_vectors_cuda
+from radio_astronomy_cuda_bench.real_inputs import load_ws_grid_average_fixture
+
 TASK_ID = "level2/04-ws-recon-grid-average"
+SUPPORTED_SCALES = ["smoke", "nside512_full", "nside4096_full"]
 
 CPP_SRC = r"""
 #include <torch/extension.h>
@@ -123,14 +128,16 @@ class ModelNew(Model):
     pass
 
 
-def get_inputs():
+def get_inputs(scale: str = "smoke", segment_profile: str = "all10", fixture: str | None = None):
+    if fixture:
+        return load_ws_grid_average_fixture(fixture, scale=scale, tile_pix=256)
     device = "cuda"
-    n_chunk = 8192
-    RES = 64
+    cfg = get_scale(scale)
+    n_chunk = int(cfg.npix)
+    RES = 64 if scale == "smoke" else 512
     half = RES // 2
-    nuniq = 256
-    l, m, n = make_unit_vectors(n_chunk, device=device, seed=12)
-    # Nonzero keys in flattened RES x RES grid. Keep them in [1, RES*RES].
+    nuniq = 256 if scale == "smoke" else 8192
+    l, m, n = make_unit_vectors_cuda(n_chunk, device=device, seed=12)
     keys_unique = torch.linspace(1, RES * RES, nuniq, device=device, dtype=torch.float32).round().to(torch.int32)
     phase = torch.linspace(0.0, 6.2831853, nuniq, device=device)
     viss_avg = torch.stack([torch.cos(phase), torch.sin(phase)], dim=1).to(torch.float32).contiguous()

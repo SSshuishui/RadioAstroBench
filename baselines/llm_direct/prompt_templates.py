@@ -17,8 +17,12 @@ SYSTEM_PROMPT = dedent(
     - The snippet must be self-contained when appended to the original task file.
     - The snippet may reuse imports already available in the task file: torch, nn, load_inline, os.
     - The snippet must not use external packages other than torch/PyTorch extension machinery.
-    - Prefer safe, incremental optimizations over formula changes.
-    - If you are uncertain, create a candidate that preserves semantics exactly.
+    - Do not call get_extension().
+    - Do not call original ext.<function>(...) baseline extension symbols.
+    - Do not inherit ModelNew from Model.
+    - Do not copy the original CUDA kernel and only rename functions or variables.
+    - A valid candidate must make a material implementation change.
+    - Prefer safe, incremental optimizations over formula changes, but do not return a trivial identity wrapper.
     """
 ).strip()
 

@@ -10,7 +10,10 @@ import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load_inline
 
+from radio_astronomy_cuda_bench.configs.scales import get_scale
+
 TASK_ID = "level1/03-ws-pix2lmn-nest"
+SUPPORTED_SCALES = ["smoke", "nside512_full", "nside4096_full", "nside16384_full"]
 
 CPP_SRC = r"""
 #include <torch/extension.h>
@@ -173,8 +176,11 @@ class ModelNew(Model):
     pass
 
 
-def get_inputs():
-    return [64, 0, 4096]
+def get_inputs(scale: str = "smoke", segment_profile: str = "all10", fixture: str | None = None):
+    cfg = get_scale(scale)
+    if cfg.nside is None:
+        return [64, 0, 4096]
+    return [int(cfg.nside), 0, int(cfg.npix)]
 
 
 def get_init_inputs():

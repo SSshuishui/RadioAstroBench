@@ -11,7 +11,12 @@ import torch.nn as nn
 from torch.utils.cpp_extension import load_inline
 from radio_astronomy_cuda_bench.common import make_unit_vectors, make_float4
 
+from radio_astronomy_cuda_bench.configs.scales import get_scale
+from radio_astronomy_cuda_bench.common import make_unit_vectors_cuda
+from radio_astronomy_cuda_bench.real_inputs import load_ws_recon_rep_fixture
+
 TASK_ID = "level2/03-ws-recon-representative"
+SUPPORTED_SCALES = ["smoke", "nside512_full", "nside4096_full"]
 
 CPP_SRC = r"""
 #include <torch/extension.h>
@@ -162,11 +167,14 @@ class ModelNew(Model):
     pass
 
 
-def get_inputs():
+def get_inputs(scale: str = "smoke", segment_profile: str = "all10", fixture: str | None = None):
+    if fixture:
+        return load_ws_recon_rep_fixture(fixture, scale=scale, tile_pix=256)
     device = "cuda"
-    n_chunk = 8192
-    nuniq = 256
-    l, m, n = make_unit_vectors(n_chunk, device=device, seed=8)
+    cfg = get_scale(scale)
+    n_chunk = int(cfg.npix)
+    nuniq = 256 if scale == "smoke" else 8192
+    l, m, n = make_unit_vectors_cuda(n_chunk, device=device, seed=8)
     keys_unique = torch.arange(1, nuniq + 1, device=device, dtype=torch.int32)
     ugu_list = torch.linspace(-8.0, 8.0, nuniq, device=device, dtype=torch.float32)
     vgu_list = torch.linspace(7.0, -7.0, nuniq, device=device, dtype=torch.float32)
