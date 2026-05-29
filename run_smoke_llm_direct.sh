@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# export LLM_API_KEY="sk-0f7bda33f62e4413ae233c93b8492973"
-
-# 不建议把真实 key 写进脚本；这里改成从外部环境读取
-: "${LLM_API_KEY:?Please export LLM_API_KEY first}"
-
+export LLM_API_KEY=""
 export LLM_API_BASE="https://api.deepseek.com"
 export LLM_MODEL="deepseek-v4-pro"
 

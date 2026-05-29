@@ -19,7 +19,7 @@ export CUDAHOSTCXX=/usr/bin/g++
 # export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export RKB_RADIO_ASTRO_DATA_ROOT="${RKB_RADIO_ASTRO_DATA_ROOT:-$PWD/radio_astro_data}"
 
-export LLM_API_KEY="sk-0f7bda33f62e4413ae233c93b8492973"
+export LLM_API_KEY=""
 export LLM_API_BASE="https://api.deepseek.com"
 export LLM_MODEL="deepseek-v4-pro"
 
