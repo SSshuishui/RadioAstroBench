@@ -27,24 +27,86 @@ def _failure_text(out: EvalOutcome) -> str:
     return "\n\n".join(parts)
 
 
+def _try_resolve_fixture_for_original_task(
+    *,
+    original_task_path: Path | None,
+    fixture_profile: str | None,
+) -> str | None:
+    """Resolve real-data fixtures with the original radio_bench task path.
+
+    CudaForge writes candidates into baselines/cudaforge/runs/..., so resolving
+    fixtures from the candidate path would miss the task-id mapping and silently
+    fall back to synthetic inputs. This keeps fixture resolution tied to the original benchmark task.
+    """
+    if not original_task_path or not fixture_profile:
+        return None
+    try:
+        from radio_astronomy_cuda_bench.configs.real_fixtures import resolve_fixture
+        resolved = resolve_fixture(original_task_path, profile=fixture_profile)
+    except Exception:
+        return None
+    return str(resolved) if resolved else None
+
+
+def _env(repo_root: Path, device: int) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    env["TORCH_CUDA_ARCH_LIST"] = os.environ.get("RKB_CUDA_ARCH_LIST", "8.9")
+    env.setdefault("CC", "/usr/bin/gcc")
+    env.setdefault("CXX", "/usr/bin/g++")
+    env.setdefault("CUDAHOSTCXX", "/usr/bin/g++")
+    env.setdefault("NVCC_APPEND_FLAGS", "-allow-unsupported-compiler")
+    env["CUDA_VISIBLE_DEVICES"] = str(device)
+    return env
+
+
+def _score_from_radio_metrics(metrics: Dict[str, Any]) -> float:
+    v = metrics.get("candidate_speedup")
+    if isinstance(v, (int, float)):
+        return float(v)
+    base = metrics.get("baseline_ms")
+    cand = metrics.get("candidate_ms")
+    if isinstance(base, (int, float)) and isinstance(cand, (int, float)) and cand > 0:
+        return float(base) / float(cand)
+    # Backward compatibility for older harness outputs only.
+    old = metrics.get("identity_speedup")
+    if isinstance(old, (int, float)):
+        return float(old)
+    base = metrics.get("baseline_ms")
+    cand = metrics.get("identity_candidate_ms")
+    if isinstance(base, (int, float)) and isinstance(cand, (int, float)) and cand > 0:
+        return float(base) / float(cand)
+    return float("-inf")
+
+
 def evaluate_radio(
     *,
     repo_root: Path,
     candidate_task: Path,
+    original_task_path: Path | None = None,
     scale: str,
     segment_profile: str,
+    fixture: str | None = None,
+    fixture_profile: str | None = None,
+    require_fixture: bool = False,
     warmup: int,
     repeat: int,
     device: int,
     timeout_s: int,
     json_path: Path,
 ) -> EvalOutcome:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
-    env.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
-    env["CUDA_VISIBLE_DEVICES"] = str(device)
+    effective_fixture = fixture
+    auto_resolved_fixture = None
+    if not effective_fixture and fixture_profile and original_task_path is not None:
+        auto_resolved_fixture = _try_resolve_fixture_for_original_task(
+            original_task_path=original_task_path,
+            fixture_profile=fixture_profile,
+        )
+        if auto_resolved_fixture:
+            effective_fixture = auto_resolved_fixture
+
     cmd = [
-        sys.executable, "-m", "radio_astronomy_cuda_bench.run_smoke",
+        sys.executable, "-m", "radio_astronomy_cuda_bench.run_bench",
         "--task", str(candidate_task),
         "--scale", scale,
         "--segment-profile", segment_profile,
@@ -52,7 +114,14 @@ def evaluate_radio(
         "--repeat", str(repeat),
         "--json", str(json_path),
     ]
-    proc = subprocess.run(cmd, cwd=str(repo_root), env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_s)
+    if effective_fixture:
+        cmd.extend(["--fixture", effective_fixture])
+    if fixture_profile:
+        cmd.extend(["--fixture-profile", fixture_profile])
+    if require_fixture:
+        cmd.append("--require-fixture")
+
+    proc = subprocess.run(cmd, cwd=str(repo_root), env=_env(repo_root, device), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_s)
     metrics: Dict[str, Any] = {"runnable": False, "message": "no result json"}
     ok = False
     score = float("-inf")
@@ -61,13 +130,14 @@ def evaluate_radio(
             data = json.loads(json_path.read_text(encoding="utf-8"))
             item = data[0] if isinstance(data, list) and data else data
             metrics = dict(item)
-            corr = metrics.get("identity_correctness") or metrics.get("correctness") or {}
+            metrics["auto_resolved_fixture"] = auto_resolved_fixture
+            metrics["effective_fixture"] = effective_fixture
+            # Prefer the current candidate_* fields. identity_* is kept only for old JSONs.
+            corr = metrics.get("candidate_correctness") or metrics.get("identity_correctness") or metrics.get("correctness") or {}
             ok = bool(corr.get("passed", False)) and "error" not in metrics and not metrics.get("skipped")
             metrics["runnable"] = ok
             if ok:
-                base = float(metrics.get("baseline_ms", 0.0) or 0.0)
-                cand = float(metrics.get("identity_candidate_ms", 0.0) or 0.0)
-                score = base / max(1e-9, cand)
+                score = _score_from_radio_metrics(metrics)
                 metrics["score"] = score
         except Exception as e:
             metrics = {"runnable": False, "error_type": "ResultParseError", "message": str(e)}

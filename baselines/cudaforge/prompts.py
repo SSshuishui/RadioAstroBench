@@ -5,7 +5,20 @@ from string import Template
 from textwrap import dedent
 from typing import Any, Optional
 
-DEFAULT_SYSTEM_PROMPT = """You are a senior CUDA-kernel optimisation specialist. Generate high-quality, compilable, runnable Python code that builds and launches hand-written CUDA kernels. Return code only in a python code block."""
+DEFAULT_SYSTEM_PROMPT = """You are an expert CUDA/PyTorch extension optimizer.
+You will receive one self-contained benchmark task file. The task already defines Model, get_inputs, and correctness checks.
+Your job is to append a replacement candidate implementation by defining class ModelNew only.
+
+Hard rules:
+- Return only Python/CUDA code. Do not include prose.
+- Do not modify get_inputs, Model, task metadata, fixture loading, or output comparison logic.
+- Preserve the ModelNew.forward input signature and output semantics of Model.forward.
+- Do not wrap, inherit from, instantiate, or delegate to the baseline Model.
+- Do not call the original get_extension() function.
+- If you define a new extension, use a separate loader name such as get_optimized_extension().
+- Do not require new inputs. Any preprocessing must happen inside ModelNew.forward and is included in timing.
+- Prefer correctness over risky optimization, but do not return a trivial identity wrapper.
+"""
 
 GPU_SPEC = {
     "RTX 4090": {
@@ -43,13 +56,16 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def build_seed_prompt(arch_path: Path, gpu_name: str, dataset: str) -> str:
+def build_seed_prompt(arch_path: Path, gpu_name: str, dataset: str, *, scale: str = "smoke", fixture_profile: Optional[str] = None) -> str:
     src = _read(arch_path)
-    extra = "" if dataset == "kernelbench" else dedent("""
+    fixture_note = f"The evaluation may use fixture_profile={fixture_profile}; do not change fixture loading or get_inputs." if fixture_profile else "The evaluation may use synthetic inputs from get_inputs; do not change get_inputs."
+    extra = "" if dataset == "kernelbench" else dedent(f"""
     RADIO_BENCH RULES:
     - This task is an existing CUDA scientific benchmark. Preserve the physical/geometry semantics.
+    - Evaluation scale: {scale}. {fixture_note}
     - Do not remove occultation/visibility checks, half-symmetry behavior, or output shape/dtype semantics.
-    - You may redefine ModelNew and add new CUDA extension code; do not change Model/get_inputs/TASK_ID.
+    - You may redefine ModelNew and add new CUDA extension code; do not change Model/get_inputs/TASK_ID/SUPPORTED_SCALES.
+    - Do not inherit ModelNew from Model and do not instantiate/delegate to Model.
     """).strip()
     return dedent(f"""
     # Target GPU
@@ -65,6 +81,7 @@ def build_seed_prompt(arch_path: Path, gpu_name: str, dataset: str) -> str:
     2. The code must be self-contained when appended to the task file or used as a candidate module.
     3. Do not include testing code or prose.
     4. Do not specify -arch, -gencode, compute_XX, or sm_XX flags.
+    5. Do not call get_extension() or baseline Model.
 
     Few-shot original:
     ```python
@@ -129,7 +146,7 @@ def build_error_prompt(old_code: str, error_log: str, problem: Any, gpu_name: st
     {old_code[-16000:]}
     ```
 
-    Return only corrected Python code defining ModelNew and any helper extension code. No prose.
+    Return only corrected Python code defining ModelNew and any helper extension code. No prose. Do not call get_extension() or baseline Model.
     """).strip()
 
 
@@ -187,4 +204,5 @@ def build_optimization_prompt(arch_path: Path, gpu_name: str, optimization_sugge
     - Preserve public API, shapes, dtypes, and semantics.
     - Do not include testing code or prose.
     - Do not specify CUDA architecture flags.
+    - Do not call get_extension() or baseline Model.
     """).strip()

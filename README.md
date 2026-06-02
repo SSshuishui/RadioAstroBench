@@ -10,7 +10,6 @@ radio_astronomy_cuda_bench/        # radio_bench harness and shared utilities
 kernelbench/                      # outer KernelBench dataset, shared by cudaforge/kernelmem
 
 baselines/
-  llm_direct/                     # simple LLM-only baseline for radio_bench
   cudaforge/                      # CudaForge workflow implemented in this framework
   kernelmem/                      # placeholder for next baseline
 
@@ -89,3 +88,22 @@ CUDA_VISIBLE_DEVICES=0 python -m baselines.cudaforge.run_cudaforge \
 ```
 
 If `ncu` is not configured on the machine, add `--no-ncu` for debugging. Formal CudaForge comparisons should run with NCU enabled.
+
+## 2026-06-02 update: CudaForge radio_bench compatibility
+
+The CudaForge baseline was updated so `--dataset radio` evaluates generated `ModelNew` candidates through `radio_astronomy_cuda_bench.run_bench` and reads the current `candidate_ms`, `candidate_speedup`, and `candidate_correctness` fields rather than the older `identity_*` fields. All CudaForge reproduction code is kept under `baselines/cudaforge/`.
+
+Additional radio_bench options are now supported by CudaForge:
+
+```bash
+python -m baselines.cudaforge.run_cudaforge \
+  --dataset radio \
+  --task radio_bench/level2/03-ws-recon-representative.py \
+  --scale nside512_full \
+  --fixture-profile nside512_day1_10m_ring \
+  --server_type deepseek \
+  --model_name deepseek-v4-pro \
+  --round 3
+```
+
+For real-data runs, set `RKB_RADIO_ASTRO_DATA_ROOT` to the directory containing fixture profiles such as `radio_astro_data/nside512_day1_10m_ring`.  Pass `--require-fixture` if you want tasks without mapped fixtures to be skipped rather than falling back to synthetic scale inputs.

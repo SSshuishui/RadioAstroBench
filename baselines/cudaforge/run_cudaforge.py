@@ -40,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--server_port", type=int, default=8000)
     p.add_argument("--model_name", default="deepseek-coder")
     p.add_argument("--round", "-G", type=int, default=5)
+    p.add_argument("--max-iters", dest="max_iters", type=int, default=None, help="Alias for --round; kept for radio smoke/real scripts")
     p.add_argument("--work_dir", type=Path, default=Path("runs/cudaforge"))
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--warmup", type=int, default=3)
@@ -50,6 +51,9 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--top_p", type=float, default=1.0)
     p.add_argument("--scale", default="smoke", help="radio_bench only")
     p.add_argument("--segment-profile", default="all10", help="radio_bench only")
+    p.add_argument("--fixture", default=None, help="radio_bench only: explicit fixture .pt/.json path")
+    p.add_argument("--fixture-profile", default=None, help="radio_bench only: real fixture profile, e.g. nside512_day1_10m_ring")
+    p.add_argument("--require-fixture", action="store_true", help="radio_bench only: skip/fail tasks without mapped real fixtures")
     p.add_argument("--timeout-s", type=int, default=600)
     p.add_argument("--first_n", type=int, default=0)
     p.add_argument("--num_tasks", type=int, default=1)
@@ -107,8 +111,12 @@ def _evaluate(args, repo: Path, dataset: str, task: Path, candidate: Path, attem
         return evaluate_radio(
             repo_root=repo,
             candidate_task=candidate,
+            original_task_path=task,
             scale=args.scale,
             segment_profile=args.segment_profile,
+            fixture=args.fixture,
+            fixture_profile=args.fixture_profile,
+            require_fixture=args.require_fixture,
             warmup=args.warmup,
             repeat=args.repeat,
             device=args.device,
@@ -210,7 +218,7 @@ def _run_one(args, repo: Path, task: Path, batch_dir: Path) -> Dict[str, Any]:
             raw = _mock_code()
             call_type = "mock"
         elif round_idx == 0:
-            prompt = build_seed_prompt(task, args.gpu, args.dataset)
+            prompt = build_seed_prompt(task, args.gpu, args.dataset, scale=args.scale, fixture_profile=args.fixture_profile)
             (io_dir / f"round{round_idx:03d}_seed_prompt.txt").write_text(prompt, encoding="utf-8")
             raw = _call_llm(args, prompt, DEFAULT_SYSTEM_PROMPT, log_path, "seed", round_idx)
             call_type = "seed"
@@ -241,7 +249,7 @@ def _run_one(args, repo: Path, task: Path, batch_dir: Path) -> Dict[str, Any]:
 
         (io_dir / f"round{round_idx:03d}_{call_type}_raw_reply.txt").write_text(raw, encoding="utf-8")
         try:
-            candidate_code = normalize_candidate(raw)
+            candidate_code = normalize_candidate(raw, original_source=original)
             candidate_source = make_candidate_source(original, candidate_code, comment=f"CudaForge {call_type} round={round_idx}")
             ind = KernelIndividual(candidate_source)
             ind.save_code(code_dir)
@@ -287,6 +295,8 @@ def _run_one(args, repo: Path, task: Path, batch_dir: Path) -> Dict[str, Any]:
 
 def main():
     args = _parser().parse_args()
+    if getattr(args, "max_iters", None) is not None:
+        args.round = args.max_iters
     repo = _repo_root()
     task_path = Path(args.task)
     if not task_path.is_absolute():
@@ -302,7 +312,18 @@ def main():
         summary.append(_run_one(args, repo, t, batch))
     avg = sum(x["best_score"] for x in summary) / max(1, len(summary))
     acc = sum(1 for x in summary if x["best_runnable"]) / max(1, len(summary))
-    out = {"avg_speedup": avg, "accuracy": acc, "num_tasks": len(summary), "tasks": summary, "timestamp": datetime.now().isoformat(timespec="seconds")}
+    out = {
+        "avg_speedup": avg,
+        "accuracy": acc,
+        "num_tasks": len(summary),
+        "dataset": args.dataset,
+        "scale": args.scale,
+        "segment_profile": args.segment_profile,
+        "fixture": args.fixture,
+        "fixture_profile": args.fixture_profile,
+        "tasks": summary,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
     (batch / "summary.json").write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
     with (batch / "summary.csv").open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
