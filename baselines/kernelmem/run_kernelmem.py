@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -28,6 +29,31 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")
 
 
+def _score_from_result(result_json: Optional[dict]) -> float:
+    if not isinstance(result_json, dict):
+        return float("-inf")
+    v = result_json.get("score") or result_json.get("candidate_speedup") or result_json.get("identity_speedup")
+    if isinstance(v, (int, float)):
+        return float(v)
+    base = result_json.get("baseline_ms")
+    cand = result_json.get("candidate_ms") or result_json.get("identity_candidate_ms")
+    if isinstance(base, (int, float)) and isinstance(cand, (int, float)) and cand > 0:
+        return float(base) / float(cand)
+    return float("-inf")
+
+
+def _accuracy_from_summary(summary: Dict) -> float:
+    attempts = summary.get("attempts", [])
+    return 1.0 if any(a.get("ok") for a in attempts) else 0.0
+
+
+def _path_for_summary(path: Path, root: Path) -> str:
+    try:
+        return str(path.relative_to(root))
+    except ValueError:
+        return str(path)
+
+
 def discover_tasks(repo_root: Path, bench: str, level: Optional[str]) -> List[Path]:
     if bench == "radio":
         base = repo_root / "radio_bench"
@@ -41,7 +67,8 @@ def discover_tasks(repo_root: Path, bench: str, level: Optional[str]) -> List[Pa
 
 
 def mock_snippet() -> str:
-    return "class ModelNew(Model):\n    pass\n"
+    # Mock is only intended for the default radio_bench/level1/05-ws-build-nm1.py smoke harness test.
+    return "class ModelNew(nn.Module):\n    def forward(self, n):\n        return n - 1.0\n"
 
 
 def evaluate(
@@ -56,8 +83,12 @@ def evaluate(
         return evaluate_radio(
             repo_root=repo_root,
             candidate_task=candidate_task,
+            original_task_path=args.original_task_path if hasattr(args, "original_task_path") else None,
             scale=args.scale,
             segment_profile=args.segment_profile,
+            fixture=args.fixture,
+            fixture_profile=args.fixture_profile,
+            require_fixture=args.require_fixture,
             warmup=args.warmup,
             repeat=args.repeat,
             timeout_s=args.timeout_s,
@@ -167,14 +198,18 @@ def run_one_task(
 
         candidate_task = attempt_dir / "candidate_task.py"
         candidate_task.write_text(candidate_src, encoding="utf-8")
+        args.original_task_path = task_path
         result = evaluate(bench=bench, repo_root=repo_root, candidate_task=candidate_task, args=args, attempt_dir=attempt_dir)
         (attempt_dir / "stdout.txt").write_text(result.stdout, encoding="utf-8", errors="replace")
         (attempt_dir / "stderr.txt").write_text(result.stderr, encoding="utf-8", errors="replace")
-        record = {"round": attempt, "ok": result.ok, "returncode": result.returncode, "bench_result": result.result_json}
+        score = _score_from_result(result.result_json)
+        record_score = score if math.isfinite(score) else None
+        record = {"round": attempt, "ok": result.ok, "score": record_score, "returncode": result.returncode, "bench_result": result.result_json}
         summary["attempts"].append(record)
         write_json(attempt_dir / "result.json", record)
         previous_snippet = snippet
         previous_failure = result.failure_text()
+        print(f"[{rel}] Round {attempt}: runnable={result.ok} score={score}", flush=True)
 
         if result.ok and args.enable_ncu and bench == "radio":
             ncu_text = maybe_profile_radio_task(
@@ -182,6 +217,9 @@ def run_one_task(
                 candidate_task=candidate_task,
                 scale=args.scale,
                 segment_profile=args.segment_profile,
+                fixture=args.fixture,
+                fixture_profile=args.fixture_profile,
+                require_fixture=args.require_fixture,
                 cuda_visible_devices=args.cuda_visible_devices,
                 out_dir=attempt_dir / "ncu",
                 timeout_s=args.ncu_timeout_s,
@@ -189,12 +227,17 @@ def run_one_task(
             (attempt_dir / "ncu_feedback.txt").write_text(ncu_text, encoding="utf-8", errors="replace")
 
         if result.ok:
-            summary["best"] = {
-                "round": attempt,
-                "candidate_task": str(candidate_task.relative_to(repo_root)),
-                "candidate_snippet": str((attempt_dir / "candidate_snippet.py").relative_to(repo_root)),
-                "bench_result": result.result_json,
-            }
+            current_best_score = float("-inf")
+            if isinstance(summary.get("best"), dict):
+                current_best_score = float(summary["best"].get("score", float("-inf")))
+            if score > current_best_score:
+                summary["best"] = {
+                    "round": attempt,
+                    "score": record_score,
+                    "candidate_task": _path_for_summary(candidate_task, repo_root),
+                    "candidate_snippet": _path_for_summary(attempt_dir / "candidate_snippet.py", repo_root),
+                    "bench_result": result.result_json,
+                }
             if not args.continue_after_success:
                 break
 
@@ -205,6 +248,7 @@ def run_one_task(
 def main() -> None:
     parser = argparse.ArgumentParser(description="KernelMem-style baseline for radio_bench and KernelBench.")
     parser.add_argument("--bench", choices=["radio", "kernelbench"], default="radio")
+    parser.add_argument("--dataset", choices=["radio", "kernelbench"], default=None, help="Alias for --bench, matching other baselines.")
     parser.add_argument("--task", default="", help="Task path. If omitted, use --level.")
     parser.add_argument("--level", default="", choices=["", "level1", "level2", "level3", "level4"])
     parser.add_argument("--num-tasks", type=int, default=0)
@@ -213,13 +257,21 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--round", type=int, default=None, help="Alias for --rounds.")
+    parser.add_argument("--max-iters", dest="max_iters", type=int, default=None, help="Alias for --rounds.")
     parser.add_argument("--continue-after-success", action="store_true")
     parser.add_argument("--timeout-s", type=int, default=300)
     parser.add_argument("--cuda-visible-devices", default=os.environ.get("CUDA_VISIBLE_DEVICES", "0"))
+    parser.add_argument("--device", type=int, default=None, help="CUDA device index alias. Overrides --cuda-visible-devices when set.")
     parser.add_argument("--atol", type=float, default=1e-3)
     parser.add_argument("--rtol", type=float, default=1e-3)
     parser.add_argument("--model", default="")
     parser.add_argument("--api-base", default="")
+    parser.add_argument("--server_type", default="", help="Accepted for compatibility; OpenAI-compatible API env vars are used.")
+    parser.add_argument("--model_name", default="", help="Alias for --model.")
+    parser.add_argument("--fixture", default=None, help="radio_bench only: explicit fixture .pt/.json path")
+    parser.add_argument("--fixture-profile", default=None, help="radio_bench only: real fixture profile, e.g. nside512_day1_10m_ring")
+    parser.add_argument("--require-fixture", action="store_true", help="radio_bench only: skip/fail tasks without mapped real fixtures")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--long-memory-chars", type=int, default=24000)
@@ -229,6 +281,16 @@ def main() -> None:
     parser.add_argument("--out-dir", default="baselines/kernelmem/runs")
     parser.add_argument("--mock", action="store_true", help="Append identity ModelNew without calling LLM; useful to test harness.")
     args = parser.parse_args()
+    if args.dataset:
+        args.bench = args.dataset
+    if args.max_iters is not None:
+        args.rounds = args.max_iters
+    if args.round is not None:
+        args.rounds = args.round
+    if args.device is not None:
+        args.cuda_visible_devices = str(args.device)
+    if args.model_name and not args.model:
+        args.model = args.model_name
 
     repo_root = Path(__file__).resolve().parents[2]
     if args.task:
@@ -262,7 +324,7 @@ def main() -> None:
         "repeat": args.repeat,
         "enable_ncu": args.enable_ncu,
         "llm": llm_public,
-        "tasks": [str(t.relative_to(repo_root)) for t in tasks],
+        "tasks": [_path_for_summary(t, repo_root) for t in tasks],
     }
     write_json(run_root / "run_meta.json", meta)
     memory_bank = MemoryBank(repo_root / "baselines/kernelmem")
@@ -271,8 +333,25 @@ def main() -> None:
     for task in tasks:
         print(f"\n=== KernelMem bench={args.bench} task={task.relative_to(repo_root)} ===", flush=True)
         summaries.append(run_one_task(repo_root=repo_root, task_path=task, bench=args.bench, args=args, run_root=run_root, client=client, memory_bank=memory_bank))
-    write_json(run_root / "summary.json", summaries)
-    print(f"\nWrote run dir: {run_root}")
+
+    best_scores = [float(s.get("best", {}).get("score")) for s in summaries if isinstance(s.get("best"), dict) and isinstance(s.get("best", {}).get("score"), (int, float))]
+    avg_speedup = sum(best_scores) / len(best_scores) if best_scores else 0.0
+    accuracy = sum(_accuracy_from_summary(s) for s in summaries) / max(1, len(summaries))
+    global_summary = {
+        "baseline": "kernelmem",
+        "bench": args.bench,
+        "scale": args.scale,
+        "fixture": args.fixture,
+        "fixture_profile": args.fixture_profile,
+        "rounds": args.rounds,
+        "avg_speedup": avg_speedup,
+        "accuracy": accuracy,
+        "num_tasks": len(summaries),
+        "tasks": summaries,
+    }
+    write_json(run_root / "summary.json", global_summary)
+    print(f"\n[GLOBAL] Saved {run_root / 'summary.json'}")
+    print(f"[GLOBAL] avg_speedup={avg_speedup:.4f} accuracy={accuracy:.4f}")
 
 
 if __name__ == "__main__":

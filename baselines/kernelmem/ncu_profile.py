@@ -14,6 +14,9 @@ def maybe_profile_radio_task(
     candidate_task: Path,
     scale: str,
     segment_profile: str,
+    fixture: str | None = None,
+    fixture_profile: str | None = None,
+    require_fixture: bool = False,
     cuda_visible_devices: str,
     out_dir: Path,
     timeout_s: int = 600,
@@ -34,7 +37,7 @@ def maybe_profile_radio_task(
         "all",
         sys.executable,
         "-m",
-        "radio_astronomy_cuda_bench.run_smoke",
+        "radio_astronomy_cuda_bench.run_bench",
         "--task",
         str(candidate_task),
         "--scale",
@@ -45,8 +48,13 @@ def maybe_profile_radio_task(
         "1",
         "--repeat",
         "1",
-        "--no-identity",
     ]
+    if fixture:
+        cmd.extend(["--fixture", fixture])
+    if fixture_profile:
+        cmd.extend(["--fixture-profile", fixture_profile])
+    if require_fixture:
+        cmd.append("--require-fixture")
     try:
         proc = subprocess.run(cmd, cwd=repo_root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout_s)
         log_path.write_text(proc.stdout, encoding="utf-8", errors="replace")

@@ -123,26 +123,88 @@ class EvalResult:
         return "\n\n".join(parts)
 
 
+def _try_resolve_fixture_for_original_task(
+    *,
+    original_task_path: Path | None,
+    fixture_profile: str | None,
+) -> str | None:
+    """Resolve real-data fixtures using the original radio_bench task path.
+
+    KernelMem writes candidates into baselines/kernelmem/runs/..., so resolving
+    fixtures from the generated candidate path can miss the task-id mapping.
+    """
+    if not original_task_path or not fixture_profile:
+        return None
+    try:
+        from radio_astronomy_cuda_bench.configs.real_fixtures import resolve_fixture
+        resolved = resolve_fixture(original_task_path, profile=fixture_profile)
+    except Exception:
+        return None
+    return str(resolved) if resolved else None
+
+
+def _radio_env(repo_root: Path, cuda_visible_devices: str) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
+    env["TORCH_CUDA_ARCH_LIST"] = os.environ.get("RKB_CUDA_ARCH_LIST", os.environ.get("TORCH_CUDA_ARCH_LIST", "8.9"))
+    env.setdefault("CC", "/usr/bin/gcc")
+    env.setdefault("CXX", "/usr/bin/g++")
+    env.setdefault("CUDAHOSTCXX", "/usr/bin/g++")
+    env.setdefault("NVCC_APPEND_FLAGS", "-allow-unsupported-compiler")
+    env["CUDA_VISIBLE_DEVICES"] = str(cuda_visible_devices)
+    return env
+
+
+def _radio_score(result: dict | None) -> float | None:
+    if not isinstance(result, dict):
+        return None
+    v = result.get("candidate_speedup")
+    if isinstance(v, (int, float)):
+        return float(v)
+    base = result.get("baseline_ms")
+    cand = result.get("candidate_ms")
+    if isinstance(base, (int, float)) and isinstance(cand, (int, float)) and cand > 0:
+        return float(base) / float(cand)
+    # Backward compatibility for old harness JSONs.
+    v = result.get("identity_speedup")
+    if isinstance(v, (int, float)):
+        return float(v)
+    cand = result.get("identity_candidate_ms")
+    if isinstance(base, (int, float)) and isinstance(cand, (int, float)) and cand > 0:
+        return float(base) / float(cand)
+    return None
+
+
 def evaluate_radio(
     *,
     repo_root: Path,
     candidate_task: Path,
+    original_task_path: Path | None = None,
     scale: str,
     segment_profile: str,
+    fixture: str | None = None,
+    fixture_profile: str | None = None,
+    require_fixture: bool = False,
     warmup: int,
     repeat: int,
     timeout_s: int,
     cuda_visible_devices: str,
     json_path: Path,
 ) -> EvalResult:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(repo_root) + os.pathsep + env.get("PYTHONPATH", "")
-    env.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
-    env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    effective_fixture = fixture
+    auto_resolved_fixture = None
+    if not effective_fixture and fixture_profile and original_task_path is not None:
+        auto_resolved_fixture = _try_resolve_fixture_for_original_task(
+            original_task_path=original_task_path,
+            fixture_profile=fixture_profile,
+        )
+        if auto_resolved_fixture:
+            effective_fixture = auto_resolved_fixture
+
     cmd = [
         sys.executable,
         "-m",
-        "radio_astronomy_cuda_bench.run_smoke",
+        "radio_astronomy_cuda_bench.run_bench",
         "--task",
         str(candidate_task),
         "--scale",
@@ -156,20 +218,42 @@ def evaluate_radio(
         "--json",
         str(json_path),
     ]
-    proc = subprocess.run(cmd, cwd=repo_root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout_s)
+    if effective_fixture:
+        cmd.extend(["--fixture", effective_fixture])
+    if fixture_profile:
+        cmd.extend(["--fixture-profile", fixture_profile])
+    if require_fixture:
+        cmd.append("--require-fixture")
+
+    proc = subprocess.run(
+        cmd,
+        cwd=repo_root,
+        env=_radio_env(repo_root, cuda_visible_devices),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout_s,
+    )
     result = None
     if json_path.exists():
         try:
             data = json.loads(json_path.read_text(encoding="utf-8"))
             result = data[0] if isinstance(data, list) and data else data
+            if isinstance(result, dict):
+                result = dict(result)
+                result["auto_resolved_fixture"] = auto_resolved_fixture
+                result["effective_fixture"] = effective_fixture
+                score = _radio_score(result)
+                if score is not None:
+                    result["score"] = score
         except Exception:
             result = None
     ok = False
     if proc.returncode == 0 and isinstance(result, dict):
-        corr = result.get("identity_correctness") or result.get("candidate_correctness")
-        ok = bool(isinstance(corr, dict) and corr.get("passed"))
+        corr = result.get("candidate_correctness") or result.get("identity_correctness") or result.get("correctness") or {}
+        ok = bool(isinstance(corr, dict) and corr.get("passed")) and "error" not in result and not result.get("skipped")
+        result["runnable"] = ok
     return EvalResult(ok, result, proc.stdout, proc.stderr, proc.returncode)
-
 
 def evaluate_kernelbench_inprocess(
     *,

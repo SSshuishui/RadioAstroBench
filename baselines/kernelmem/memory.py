@@ -55,7 +55,10 @@ class MemoryBank:
             if isinstance(obj, list):
                 summaries.extend(obj)
             elif isinstance(obj, dict):
-                summaries.append(obj)
+                if isinstance(obj.get("tasks"), list):
+                    summaries.extend(obj["tasks"])
+                else:
+                    summaries.append(obj)
             if len(summaries) >= max_tasks:
                 break
         lines = []
@@ -67,7 +70,7 @@ class MemoryBank:
             lines.append(f"- task={task}, best={bool(best)}, ok_attempts={len(ok_attempts)}, attempts={len(attempts)}")
             if best and isinstance(best, dict):
                 bench_result = best.get("bench_result") or {}
-                speed = bench_result.get("identity_speedup") or bench_result.get("candidate_speedup")
+                speed = best.get("score") or bench_result.get("candidate_speedup") or bench_result.get("identity_speedup")
                 lines.append(f"  speedup={speed}")
         text = "\n".join(lines) if lines else "No useful previous summaries."
         return text[:max_chars]

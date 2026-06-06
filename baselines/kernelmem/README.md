@@ -1,74 +1,87 @@
 # KernelMem baseline adapter
 
-This directory contains a framework-local KernelMem-style baseline extracted from the uploaded `KernelMem-main.zip`.
+This directory contains the KernelMem-style baseline adapted to `radio_bench`, based on the uploaded `KernelMem-main.zip` and aligned with the latest runnable CudaForge radio harness in this repo.
 
-It keeps the core KernelMem ideas:
+It keeps the KernelMem baseline ingredients:
 
-- long-term memory from `memorybank/` and prompt/memory files;
+- long-term memory from `memorybank/` and KernelMem prompt/memory files;
 - short-term memory from previous local runs;
-- LLM generation of a candidate `ModelNew`;
+- LLM generation of an appended candidate `ModelNew`;
 - compile/runtime/correctness feedback repair loop;
 - optional NCU profiling feedback for `radio_bench` tasks;
 - unified support for `radio_bench/` and `kernelbench/`.
 
-## Benchmarks
+## RadioBench integration
 
-Supported benchmark roots:
+The radio evaluator uses:
 
 ```text
-radio_bench/     # existing scientific CUDA kernel benchmark
-kernelbench/     # copied from KernelMem-main/KernelBench
+python -m radio_astronomy_cuda_bench.run_bench
 ```
 
-## Mock harness test
+and reads the current RadioBench fields:
 
-```bash
-export PYTHONPATH=$PWD:$PYTHONPATH
-export TORCH_CUDA_ARCH_LIST="8.9"
-
-CUDA_VISIBLE_DEVICES=0 python -m baselines.kernelmem.run_kernelmem \
-  --bench radio \
-  --task radio_bench/level1/05-ws-build-nm1.py \
-  --scale smoke \
-  --warmup 1 \
-  --repeat 2 \
-  --rounds 1 \
-  --mock
+```text
+candidate_ms
+candidate_speedup
+candidate_correctness
 ```
 
-Or:
+It also supports real-data fixture runs:
 
-```bash
-bash baselines/kernelmem/run_radio_mock.sh
+```text
+--fixture
+--fixture-profile
+--require-fixture
 ```
 
-## Real LLM run on radio_bench
+## Smoke run
+
+From the repository root:
 
 ```bash
 export LLM_API_KEY="..."
-export LLM_API_BASE="https://.../v1"
-export LLM_MODEL="deepseek-v4-pro"
-export PYTHONPATH=$PWD:$PYTHONPATH
-export TORCH_CUDA_ARCH_LIST="8.9"
+bash run_kernelmem_radio_smoke.sh
+```
 
-CUDA_VISIBLE_DEVICES=0 python -m baselines.kernelmem.run_kernelmem \
+For a harness-only check on the default `05-ws-build-nm1` smoke task:
+
+```bash
+bash run_kernelmem_radio_mock.sh
+```
+
+## Real fixture run
+
+```bash
+export LLM_API_KEY="..."
+export RKB_RADIO_ASTRO_DATA_ROOT="$PWD/radio_astro_data"
+bash run_kernelmem_radio_real.sh nside512_day1_10m_ring
+```
+
+Optional NCU feedback:
+
+```bash
+ENABLE_NCU=1 bash run_kernelmem_radio_real.sh nside512_day1_10m_ring
+```
+
+## Single task run
+
+```bash
+export LLM_API_KEY="..."
+bash run_kernelmem_radio_one.sh radio_bench/level1/05-ws-build-nm1.py
+```
+
+or directly:
+
+```bash
+python -m baselines.kernelmem.run_kernelmem \
   --bench radio \
   --task radio_bench/level1/05-ws-build-nm1.py \
   --scale smoke \
   --warmup 3 \
   --repeat 5 \
-  --rounds 3
-```
-
-## Real LLM run on KernelBench
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m baselines.kernelmem.run_kernelmem \
-  --bench kernelbench \
-  --task kernelbench/level1/1_Square_matrix_multiplication_.py \
-  --warmup 3 \
-  --repeat 5 \
-  --rounds 3
+  --max-iters 3 \
+  --continue-after-success
 ```
 
 ## Outputs
@@ -90,4 +103,13 @@ bench_result.json
 stdout.txt
 stderr.txt
 result.json
+```
+
+The top-level `summary.json` includes:
+
+```text
+avg_speedup
+accuracy
+num_tasks
+tasks
 ```

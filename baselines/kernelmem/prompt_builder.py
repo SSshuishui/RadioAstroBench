@@ -9,12 +9,13 @@ SYSTEM_PROMPT = dedent(
 
     Required output:
     - Return Python code only, no Markdown fences.
-    - The code must define class ModelNew(nn.Module) or class ModelNew(Model).
+    - The code must define class ModelNew(nn.Module).
     - You may define CPP_SRC_NEW, CUDA_SRC_NEW, get_candidate_extension, helper kernels, and helper classes.
     - The returned code will be appended to the original task file.
 
     Hard constraints:
     - Do not change baseline Model, get_inputs, get_init_inputs, TASK_ID, or SUPPORTED_SCALES.
+    - Do not call get_extension(), instantiate baseline Model, inherit ModelNew from Model, or delegate to baseline code.
     - Preserve output shapes, dtypes, and numerical semantics.
     - Do not remove physics/geometric checks such as visibility, blockage, l/m/n, uvw, or half-symmetry logic.
     - Prefer safe incremental optimizations first; repair correctness before optimizing speed.
