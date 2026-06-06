@@ -3,11 +3,15 @@ set -euo pipefail
 
 PROFILE="${1:-nside512_day1_10m_ring}"
 SCALE="${SCALE:-nside512_full}"
-WARMUP="${WARMUP:-1}"
+WARMUP="${WARMUP:-3}"
 REPEAT="${REPEAT:-5}"
 MAX_ITERS="${MAX_ITERS:-5}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export LLM_API_KEY="${LLM_API_KEY:-}"
+export LLM_API_BASE="${LLM_API_BASE:-https://api.deepseek.com}"
+export LLM_MODEL="${LLM_MODEL:-deepseek-v4-pro}"
+
+export CUDA_VISIBLE_DEVICES=1
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 
 export CC="${CC:-/usr/bin/gcc}"
@@ -16,9 +20,6 @@ export CUDAHOSTCXX="${CUDAHOSTCXX:-/usr/bin/g++}"
 export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:--allow-unsupported-compiler}"
 export RKB_RADIO_ASTRO_DATA_ROOT="${RKB_RADIO_ASTRO_DATA_ROOT:-$PWD/radio_astro_data}"
 
-export LLM_API_KEY="${LLM_API_KEY:-}"
-export LLM_API_BASE="${LLM_API_BASE:-https://api.deepseek.com}"
-export LLM_MODEL="${LLM_MODEL:-deepseek-v4-pro}"
 
 if [ -z "${LLM_API_KEY:-}" ]; then
   echo "[ERROR] LLM_API_KEY is not set"
