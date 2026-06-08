@@ -5,7 +5,6 @@ export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 
 # export LLM_API_KEY="${LLM_API_KEY:-}"
-export LLM_API_KEY="sk-98edded97d6b42ceb0b676b5b5702d5b"
 export LLM_API_BASE="${LLM_API_BASE:-https://api.deepseek.com}"
 export LLM_MODEL="${LLM_MODEL:-deepseek-v4-pro}"
 # Set LLM_API_KEY before running.
