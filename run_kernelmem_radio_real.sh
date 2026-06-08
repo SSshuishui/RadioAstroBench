@@ -8,8 +8,8 @@ REPEAT="${REPEAT:-5}"
 MAX_ITERS="${MAX_ITERS:-5}"
 LOG_DIR="${LOG_DIR:-real_logs_kernelmem}"
 
-export PYTHONPATH="$PWD:${PYTHONPATH:-}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# export PYTHONPATH="$PWD:${PYTHONPATH:-}"
+export CUDA_VISIBLE_DEVICES=1
 export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-8.9}"
 
 export CC="${CC:-/usr/bin/gcc}"
@@ -18,7 +18,8 @@ export CUDAHOSTCXX="${CUDAHOSTCXX:-/usr/bin/g++}"
 export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:--allow-unsupported-compiler}"
 export RKB_RADIO_ASTRO_DATA_ROOT="${RKB_RADIO_ASTRO_DATA_ROOT:-$PWD/radio_astro_data}"
 
-export LLM_API_KEY="${LLM_API_KEY:-}"
+# export LLM_API_KEY="${LLM_API_KEY:-}"
+export LLM_API_KEY="sk-98edded97d6b42ceb0b676b5b5702d5b"
 export LLM_API_BASE="${LLM_API_BASE:-https://api.deepseek.com}"
 export LLM_MODEL="${LLM_MODEL:-deepseek-v4-pro}"
 
