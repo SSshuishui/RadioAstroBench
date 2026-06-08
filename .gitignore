@@ -49,3 +49,10 @@ logs
 *.tmp
 __pycache__/
 *.pyc
+# Local logs
+logs/
+**/logs/
+
+# Local dataset
+radio_astro_data/
+**/radio_astro_data/
